@@ -1712,6 +1712,10 @@ class SEVM:
         self.logs = HalmosLogs()
         self.steps: Steps = {}
 
+        # Add a cache for known infeasible destinations
+        # (maps (dst_expression_string, target) -> bool)
+        self.infeasible_jumps: dict[tuple[str, int], bool] = {}
+
         # init storage model
         is_generic = self.options.storage_layout == "generic"
         self.storage_model = GenericStorage if is_generic else SolidityStorage
@@ -2494,19 +2498,61 @@ class SEVM:
         step_id: int,
     ) -> None:
         jid = ex.jumpi_id()
-
-        target: int = ex.int_of(ex.st.pop(), "symbolic JUMPI target")
+        target = ex.st.pop()
         cond: Word = ex.st.pop()
 
+        # Handle symbolic target case first
+        if not is_concrete(target):
+            if not self.options.symbolic_jump:
+                raise NotConcreteError(f"symbolic JUMPI target: {target}")
+
+            # Create a cache key that includes both condition and target
+            dst_key = f"{cond}.{target}"
+
+            visited = ex.jumpis.get(jid, {True: 0, False: 0})
+            cond_true = simplify(is_non_zero(cond))
+            cond_false = simplify(is_zero(cond))
+
+            potential_true = ex.check(cond_true) != unsat
+            potential_false = ex.check(cond_false) != unsat
+
+            # Handle true branch with symbolic target
+            if potential_true and visited[True] < self.options.loop:
+                for jump_target in ex.pgm.valid_jump_destinations():
+                    # Check cache for this condition+target combination
+                    if (dst_key, jump_target) in self.infeasible_jumps:
+                        continue
+
+                    target_reachable = simplify(And(cond_true, target == jump_target))
+                    if ex.check(target_reachable) != unsat:
+                        new_ex = self.create_branch(ex, target_reachable, jump_target)
+                        new_ex.jumpis[jid] = {
+                            True: visited[True] + 1,
+                            False: visited[False],
+                        }
+                        stack.push(new_ex, step_id)
+                    else:
+                        self.infeasible_jumps[(dst_key, jump_target)] = True
+
+            # Handle false branch (always concrete - just advances PC)
+            if potential_false and visited[False] < self.options.loop:
+                new_ex = ex
+                new_ex.path.append(cond_false, branching=True)
+                new_ex.advance_pc()
+                new_ex.jumpis[jid] = {True: visited[True], False: visited[False] + 1}
+                stack.push(new_ex, step_id)
+
+            return
+
+        # Handle concrete target case
+        target_int = int_of(target)
         visited = ex.jumpis.get(jid, {True: 0, False: 0})
 
         cond_true = simplify(is_non_zero(cond))
         cond_false = simplify(is_zero(cond))
 
-        potential_true: bool = ex.check(cond_true) != unsat
-        potential_false: bool = ex.check(cond_false) != unsat
-
-        # note: both may be false if the previous path condition was considered unknown but turns out to be unsat later
+        potential_true = ex.check(cond_true) != unsat
+        potential_false = ex.check(cond_false) != unsat
 
         follow_true = False
         follow_false = False
@@ -2533,11 +2579,11 @@ class SEVM:
 
         if follow_true:
             if follow_false:
-                new_ex_true = self.create_branch(ex, cond_true, target)
+                new_ex_true = self.create_branch(ex, cond_true, target_int)
             else:
                 new_ex_true = ex
                 new_ex_true.path.append(cond_true, branching=True)
-                new_ex_true.pc = target
+                new_ex_true.pc = target_int
 
         if follow_false:
             new_ex_false = ex
@@ -2567,16 +2613,27 @@ class SEVM:
         if is_concrete(dst):
             ex.pc = int_of(dst)
             stack.push(ex, step_id)
+            return
 
-        # otherwise, create a new execution for feasible targets
-        elif self.options.symbolic_jump:
-            for target in ex.pgm.valid_jump_destinations():
-                target_reachable = simplify(dst == target)
-                if ex.check(target_reachable) != unsat:  # jump
-                    new_ex = self.create_branch(ex, target_reachable, target)
-                    stack.push(new_ex, step_id)
-        else:
+        if not self.options.symbolic_jump:
             raise NotConcreteError(f"symbolic JUMP target: {dst}")
+
+        # We'll store a string representation of dst as our cache key
+        dst_key = str(dst)
+
+        for target in ex.pgm.valid_jump_destinations():
+            # 1) Check if we've already seen this as infeasible
+            if (dst_key, target) in self.infeasible_jumps:
+                continue  # skip it directly
+
+            # 2) Otherwise, test feasibility
+            target_reachable = simplify(dst == target)
+            if ex.check(target_reachable) != unsat:  # jump is feasible
+                new_ex = self.create_branch(ex, target_reachable, target)
+                stack.push(new_ex, step_id)
+            else:
+                # Mark it infeasible to prune next time
+                self.infeasible_jumps[(dst_key, target)] = True
 
     def create_branch(self, ex: Exec, cond: BitVecRef, target: int) -> Exec:
         new_path = ex.path.branch(cond)
